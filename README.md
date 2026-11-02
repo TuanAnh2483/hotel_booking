@@ -1,366 +1,158 @@
 # Hotel Hub
 
-Hotel Hub is a hotel management and booking platform designed for hotel operators, guests, and administrators. The system manages room inventory, reservations, payments, user identity, and operational reporting in a single backend service that can support a web or mobile frontend.
+Hotel Hub is the hotel booking platform backend for managing guest reservations, room inventory, payments, and operational workflows. The system is designed around a layered Spring Boot architecture and emphasizes transactional integrity for inventory reservation and payment confirmation.
 
-Main URL: https://www.hotelhub.online
+## Overview
 
----
+- Hotels, rooms, and inventory are managed through JPA entities and repositories.
+- Booking creation validates idempotency, room availability, and date range integrity before reserving inventory.
+- Inventory reservation uses optimistic locking with `DailyInventory.@Version` and retries failed transactions safely.
+- Payment creation supports pending payment states, SePay webhook verification, and reconciliation for delayed or missed webhook events.
+- Expired unpaid bookings are cleaned up by scheduled jobs that release inventory and update booking state.
 
-## Table of Contents
+## Architecture
 
-- [Project Overview](#project-overview)
-- [Tech Stack](#tech-stack)
-- [Key Features](#key-features)
-- [System Architecture](#system-architecture)
-- [Authentication Flow](#authentication-flow)
-- [Booking Concurrency Handling](#booking-concurrency-handling)
-- [Payment Flow](#payment-flow)
-- [Database Design](#database-design)
-- [Installation & Configuration](#installation--configuration)
-- [API Documentation & Testing](#api-documentation--testing)
+The backend follows a layered design:
 
----
+- REST controllers handle incoming API requests from web clients and partner integrations.
+- Application services contain business logic for authentication, hotel search, booking, payment, and expiration flows.
+- Repositories manage persistence for bookings, payment transactions, daily inventory, and related entities.
+- PostgreSQL stores the source-of-truth transactional data.
+- SePay and VietQR/QR payment flows integrate with the platform through webhook and API-based reconciliation.
 
-## Project Overview
+## Booking flow | Inventory reservation & concurrency control
 
-Hotel Hub provides a backend platform for hotel booking, room management, user authentication, payment processing, and operational analytics. The application is built to support both online booking flows and back-office administration.
+```mermaid
+flowchart TD
+    A[Customer submits booking request] --> B[Check idempotency key<br/>(userId + key)]
+    B --> C{Existing booking<br/>for this key?}
 
-The system is designed around the following goals:
+    C -->|Yes| D[Return existing booking<br/>(no second reservation)]
+    C -->|No| E[Validate user, dates, rooms, guests<br/>and primary contact]
+    E --> F[Start a fresh transaction<br/>(createBookingOnce via Spring proxy)]
+    F --> G[Load DailyInventory rows<br/>for every date in the stay]
+    G --> H{Stay dates open and<br/>inventory range complete?}
 
-- Support real-time room availability and reservation handling
-- Enable secure user authentication and access control
-- Streamline booking lifecycle from search to payment to confirmation
-- Improve operational visibility for hotel staff and administrators
-- Support future expansion to mobile apps and third-party integrations
+    H -->|No| I[Reject booking<br/>Return conflict / validation error]
+    H -->|Yes| J{Enough rooms available?<br/>availableRooms - blockedRooms >= quantity}
 
----
+    J -->|Yes| K[Increase blockedRooms<br/>for each stay date<br/>DailyInventory uses @Version]
+    K --> L[Persist Booking + Contact + Items<br/>Calculate total price<br/>Set PENDING_PAYMENT / expiry]
+    L --> M[Flush / commit transaction<br/>Database checks @Version]
+    M --> N{Optimistic-lock<br/>conflict?}
 
-## Tech Stack
+    N -->|No| O[Commit succeeds]
+    O --> P[Return booking response<br/>Continue to payment]
 
-The project is designed as a modern backend application using the following core technologies:
+    N -->|Yes| Q[Rollback failed attempt<br/>Wait briefly; retry in a fresh transaction<br/>Maximum 3 attempts]
+    Q --> R{Attempts exhausted?}
+    R -->|No| F
+    R -->|Yes| S[Return CONFLICT<br/>Ask customer to try again]
 
-- Node.js
-- Express.js / NestJS (depending on project implementation)
-- TypeScript
-- PostgreSQL
-- Redis
-- JWT for authentication
-- Swagger / OpenAPI for API documentation
-- Docker / Docker Compose for local environment setup
-- PM2 or similar process manager for deployment
-- CI/CD support via GitHub Actions or external automation tools
-
-This stack allows the project to balance performance, reliability, extensibility, and maintainability.
-
----
-
-## Key Features
-
-- Hotel and room catalog management
-- Room search and filtering by date, room type, price, and facilities
-- Reservation creation and booking confirmation
-- Booking status tracking: pending, confirmed, checked in, completed, canceled
-- User authentication and authorization for guests and administrators
-- Payment processing for bookings and invoice settlement
-- Notification flow for confirmation, cancellation, and reminders
-- Reporting and operational analytics for occupancy and revenue
-- Role-based access control for admin/staff/customer personas
-- Audit-friendly transaction history for critical booking events
-
----
-
-## System Architecture
-
-Hotel Hub follows a modular backend architecture that separates concerns across business domains and infrastructure services.
-
-Typical architecture:
-
-```text
-Client App / Web / Mobile
-           |
-           v
-   API Layer (Node.js / Express)
-           |
-   +-------+-----------------------+
-   |                               |
-   v                               v
-Authentication Service         Booking & Reservation Service
-   |                               |
-   v                               v
-   User DB / Session Store        PostgreSQL / Redis
-                               |
-                               v
-                        Payment Service
-                               |
-                               v
-                        External Payment Gateway
+    J -->|No| I
 ```
 
-Key design principles:
+### Booking implementation notes
 
-- Separate authentication, booking, and payment concerns
-- Centralize business validation in backend services
-- Use a transactional database for core booking records
-- Use Redis for caching, rate limiting, and temporary state
-- Keep APIs REST-friendly and versionable for frontend integration
+- Booking creation checks an idempotency key before creating a second reservation.
+- Inventory is loaded per stay date and validated before reservation.
+- `DailyInventory.@Version` protects the inventory reservation from race conditions.
+- Failed optimistic-lock attempts are rolled back and retried in a fresh transaction up to three times.
+- If all attempts fail, the API returns a `CONFLICT` response to the customer.
+
+## Payment flow | VietQR + SePay webhook & reconciliation
+
+```mermaid
+flowchart TD
+    A[Customer opens payment for booking] --> B[Load owned booking<br/>Check / apply booking expiration]
+    B --> C{Booking still<br/>PENDING_PAYMENT?}
+
+    C -->|No| D[Reject payment session<br/>Booking is not payable]
+    D --> Z[Return latest payment / booking status]
+
+    C -->|Yes| E[Find valid pending payment<br/>for this booking]
+    E --> F{Reusable payment<br/>transaction exists?}
+
+    F -->|No| G[Create PENDING transaction<br/>Generate unique paymentCode<br/>Amount + expiry + bank details]
+    G --> H[Build VietQR URL / payment session<br/>Return QR + paymentCode to client]
+
+    F -->|Yes| H
+    H --> I[Customer transfers money<br/>using banking app / QR]
+    I --> J[SePay receives bank transaction<br/>and sends webhook]
+    J --> K[Webhook endpoint<br/>Public to JWT; service verifies<br/>Authorization: Apikey ...]
+    K --> L{Incoming transfer<br/>and unseen gateway ID?}
+
+    L -->|No| M[Ignore duplicate / unrelated<br/>webhook safely]
+    M --> Z
+
+    L -->|Yes| N[Resolve paymentCode<br/>Find matching PaymentTransaction]
+    N --> O{Payment code found<br/>and amount matches?}
+
+    O -->|No| P[Do not auto-confirm<br/>Record mismatch / expired state<br/>Requires review or correction]
+    P --> Z
+
+    O -->|Yes| Q{Booking still<br/>PENDING_PAYMENT?}
+
+    Q -->|Yes| R[Set transaction SUCCESS<br/>Set booking CONFIRMED<br/>Persist gateway transaction ID]
+    R --> Z
+
+    Q -->|No| P
+
+    subgraph Reconciliation
+        X[Fallback: customer clicks<br/>'I have transferred'<br/>Backend queries SePay Transaction API]
+        X --> Y[Apply the same payment-code,<br/>amount, status and idempotency checks]
+        Y -->|valid match| R
+        Y -->|not matched / invalid| P
+    end
+```
+
+### Payment implementation notes
+
+- Payment sessions are created only for bookings still in `PENDING_PAYMENT` state.
+- A reusable payment transaction is reused when the same booking still has a valid pending payment record.
+- SePay webhook requests are publicly reachable but are validated by the payment service using the configured API key.
+- Payment confirmation checks the incoming transfer type, gateway transaction identity, payment code, amount match, and whether the booking is still payable.
+- Customer-triggered reconciliation reuses the same validation checks when a webhook is delayed or missed.
+- Overdue unpaid bookings are reconciled by the scheduled expiration job, which releases inventory and keeps booking state consistent.
+
+## Database and transactional integrity
+
+The application stores essential operational data in PostgreSQL with strong consistency rules:
+
+- Users and roles
+- Hotels and room inventory
+- DailyInventory availability rows
+- Bookings, booking contacts, and booking items
+- Payment transactions and gateway metadata
+- Expiration and reconciliation records
+
+Core design rule: transactional critical paths must be atomic and idempotent, especially booking creation and payment confirmation.
+
+## API documentation and testing
+
+The project includes backend documentation and test automation support for local and pre-deploy verification.
+
+- Postman collections for smoke testing the booking and payment flows
+- Local environment configuration for JWT-based auth and payment mock/debug flows
+- Manual database workflow notes for schema-safe updates
+
+## Repository structure
+
+- `backend/` — Spring Boot backend application and business logic
+- `docs/` — DB, Postman, and diagram docs
+- `README.md` — project overview and workflow documentation
+
+## Relevant implementation source files
+
+- `backend/src/main/java/com/hotel/hotel_backend/security/SecurityConfig.java`
+- `backend/src/main/java/com/hotel/hotel_backend/security/JwtAuthFilter.java`
+- `backend/src/main/java/com/hotel/hotel_backend/service/impl/BookingServiceImpl.java`
+- `backend/src/main/java/com/hotel/hotel_backend/service/impl/InventoryServiceImpl.java`
+- `backend/src/main/java/com/hotel/hotel_backend/entity/DailyInventory.java`
+- `backend/src/main/java/com/hotel/hotel_backend/service/BookingPaymentGatewayService.java`
+- `backend/src/main/java/com/hotel/hotel_backend/controller/PaymentWebhookController.java`
+- `backend/src/main/java/com/hotel/hotel_backend/service/BookingExpirationService.java`
 
 ---
 
-## Authentication Flow
-
-The authentication flow ensures secure access for customers and administrators.
-
-1. User registers with email and password or social login provider.
-2. Backend validates input and creates a user profile.
-3. Passwords are stored in a hashed format.
-4. User logs in and receives a JWT access token.
-5. Protected endpoints validate the token before processing requests.
-6. Refresh tokens or session policies may be used for extended sessions.
-7. Authorization checks ensure role-based access for admin-only operations.
-
-Typical flow:
-
-```text
-User -> POST /auth/login
-      -> Backend validates credentials
-      -> Generate JWT
-      -> Return access token + refresh token (if enabled)
-      -> Client includes token in Authorization header
-      -> Backend verifies token on each protected request
-```
-
-Security practices:
-
-- Use strong JWT secret management
-- Store secrets in environment variables
-- Apply middleware for authenticated routes
-- Validate permission scopes by role and resource ownership
-
----
-
-## Booking Concurrency Handling
-
-Booking concurrency is one of the most important requirements for a hotel reservation platform. To prevent double-booking the same room on overlapping dates, the system must handle concurrent requests safely.
-
-Recommended approach:
-
-- Use database transactions for booking creation
-- Validate room availability within a transaction
-- Lock the room record or relevant inventory row during reservation check
-- Re-check capacity and date range before final confirmation
-- Treat booking creation as a critical section for inventory validation
-
-Example pattern:
-
-```text
-1. Customer requests booking for room X on date range D1-D2
-2. Backend begins transaction
-3. Check room availability and occupancy records
-4. If available, reserve the inventory and create booking record
-5. Commit transaction
-6. If transaction fails, return conflict or retry response
-```
-
-This approach reduces race conditions and helps maintain consistency under simultaneous bookings.
-
----
-
-## Payment Flow
-
-The payment flow supports booking confirmation and secure settlement.
-
-1. Customer selects room and submits booking details.
-2. Backend validates room availability and pricing.
-3. Payment request is created for the reservation amount.
-4. Payment gateway receives the transaction request.
-5. Gateway returns success or failure result.
-6. Backend updates booking status to confirmed only after successful payment.
-7. Payment event or webhook is processed to update ledger and notification state.
-
-Typical flow:
-
-```text
-Customer -> Create booking
-         -> Backend calculates total price
-         -> Redirect or call payment gateway
-         -> Gateway confirms successful payment
-         -> Backend updates booking status
-         -> Send confirmation email / notification
-```
-
-Important considerations:
-
-- Idempotency for payment retries
-- Secure handling of payment metadata and webhook validation
-- Clear handling of failed, pending, and refunded transactions
-- Reconciliation between booking records and payment logs
-
----
-
-## Database Design
-
-The system uses a relational database as the source of truth for core transactional data.
-
-Core entities may include:
-
-- Users
-- Roles
-- Hotels
-- Rooms
-- Room Types
-- Room Availability
-- Bookings
-- Booking Details
-- Payments
-- Transactions
-- Reviews
-- Notifications
-- Audit Logs
-
-Recommended relationships:
-
-- One user can have many bookings
-- One hotel can contain many rooms
-- One room belongs to one room type and one hotel
-- One booking can contain multiple room allocations or line items
-- One booking can have one or many payment records
-- One user can have many reviews and notifications
-
-Example logical schema:
-
-```text
-users (id, email, password_hash, role, created_at)
-roles (id, name)
-
-hotels (id, name, address, description, status)
-rooms (id, hotel_id, room_type_id, room_number, price_per_night, status)
-room_types (id, name, capacity, amenities)
-booking_status (id, name)
-bookings (id, user_id, hotel_id, room_id, check_in, check_out, total_price, status)
-payments (id, booking_id, amount, method, status, transaction_reference, created_at)
-notifications (id, user_id, type, message, is_read, created_at)
-reviews (id, user_id, hotel_id, rating, comment, created_at)
-```
-
-The database should enforce integrity constraints and support indexing for date-based availability queries.
-
----
-
-## Installation & Configuration
-
-### Prerequisites
-
-- Node.js 16+ or the version required by the project
-- npm or yarn
-- PostgreSQL
-- Redis
-- Git
-- Optional: Docker and Docker Compose
-
-### Clone Repository
-
-```bash
-git clone https://github.com/TuanAnh2483/vlu_hotel_hub.git
-cd vlu_hotel_hub
-```
-
-### Install Dependencies
-
-```bash
-npm install
-# or
-yarn install
-```
-
-### Environment Variables
-
-Create a `.env` file at the project root and configure values similar to the following:
-
-```env
-PORT=3000
-NODE_ENV=development
-DATABASE_URL=postgresql://user:password@localhost:5432/hotel_hub
-REDIS_URL=redis://localhost:6379
-JWT_SECRET=your_jwt_secret
-JWT_EXPIRES_IN=7d
-PAYMENT_GATEWAY_KEY=your_gateway_key
-PAYMENT_GATEWAY_SECRET=your_gateway_secret
-```
-
-### Run the Application
-
-Development mode:
-
-```bash
-npm run dev
-# or
-yarn dev
-```
-
-Production build:
-
-```bash
-npm run build
-npm start
-```
-
-### Database Migration
-
-If the project uses Prisma, TypeORM, or Sequelize, run migration commands as needed:
-
-```bash
-npm run migrate
-# or
-db migration commands depending on the project setup
-```
-
----
-
-## API Documentation & Testing
-
-### API Documentation
-
-The backend should expose API documentation using Swagger/OpenAPI or a dedicated docs portal.
-
-Typical access points:
-
-- `/api-docs`
-- Swagger JSON output for code generation
-- Postman or Insomnia collections for manual testing
-
-### Testing
-
-The project should include automated verification for all critical business flows.
-
-Recommended tests:
-
-- Unit tests for validation and utility logic
-- Integration tests for booking and payment endpoints
-- Authentication tests for JWT validation and role authorization
-- Concurrency tests to verify no double-booking occurs under load
-
-Example commands:
-
-```bash
-npm test
-npm run test:coverage
-```
-
-### Test Coverage Goals
-
-- Booking workflow validation
-- Authentication edge cases
-- Payment success/failure handling
-- Room availability under concurrent requests
-- API contract validation for request/response payloads
-
----
-
-## Contact
-
-If you need support or would like to report issues, please contact:
-
-- Email: tuananh240803@gmail.com
-- GitHub: https://github.com/TuanAnh2483
-
----
+This README summarizes the real implemented flow for the hotel booking platform and reflects the current backend design used by the project.
